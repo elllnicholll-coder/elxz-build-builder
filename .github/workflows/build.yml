@@ -1,0 +1,101 @@
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: 'Nama aplikasi'
+        required: true
+        type: string
+      zip_url:
+        description: 'URL download ZIP project (dari Telegram)'
+        required: false
+        type: string
+      build_mode:
+        description: 'release atau debug'
+        required: false
+        default: 'release'
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: 'stable'
+          cache: true
+
+      - name: Download project ZIP
+        if: ${{ github.event.inputs.zip_url != '' }}
+        run: |
+          echo "Downloading project from: ${{ github.event.inputs.zip_url }}"
+          curl -L --fail --retry 3 -o project.zip "${{ github.event.inputs.zip_url }}" || exit 1
+          mkdir -p work
+          unzip -o project.zip -d work
+          # Cari folder yang berisi pubspec.yaml (root project Flutter)
+          FOUND=$(find work -name "pubspec.yaml" -type f | head -n 1)
+          if [ -z "$FOUND" ]; then
+            echo "ERROR: pubspec.yaml tidak ditemukan di dalam ZIP"
+            ls -laR work
+            exit 1
+          fi
+          PROJ_DIR=$(dirname "$FOUND")
+          echo "PROJECT_DIR=$PROJ_DIR" >> $GITHUB_ENV
+          echo "Found Flutter project at: $PROJ_DIR"
+
+      - name: Flutter pub get
+        if: ${{ env.PROJECT_DIR != '' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter pub get
+          flutter --version
+
+      - name: Build APK
+        if: ${{ env.PROJECT_DIR != '' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          MODE="${{ github.event.inputs.build_mode }}"
+          if [ "$MODE" = "debug" ]; then
+            flutter build apk --debug
+          else
+            flutter build apk --release
+          fi
+
+      - name: Locate APK
+        if: ${{ env.PROJECT_DIR != '' }}
+        id: find_apk
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          APK=$(find build -name "*.apk" -type f | head -n 1)
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK tidak ditemukan setelah build"
+            find build -type f || true
+            exit 1
+          fi
+          echo "Found APK: $APK"
+          echo "apk_path=$APK" >> $GITHUB_OUTPUT
+          # Copy ke root biar mudah di-artifact
+          cp "$APK" "$GITHUB_WORKSPACE/app-release.apk"
+          ls -lh "$GITHUB_WORKSPACE/app-release.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apk
+          path: app-release.apk
+          retention-days: 2
+          if-no-files-found: error
