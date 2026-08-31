@@ -1,0 +1,159 @@
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: 'Nama aplikasi'
+        required: true
+        type: string
+      zip_url:
+        description: 'URL download ZIP (opsional)'
+        required: false
+        default: ''
+        type: string
+      url:
+        description: 'URL web opsional'
+        required: false
+        default: ''
+        type: string
+      package_name:
+        description: 'Package name'
+        required: false
+        default: 'com.elxz.app'
+        type: string
+      user_id:
+        description: 'Telegram user id'
+        required: false
+        default: ''
+        type: string
+      build_mode:
+        description: 'release atau debug'
+        required: false
+        default: 'release'
+        type: string
+      release_tag:
+        description: 'Tag GitHub Release yang berisi ZIP'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: 'stable'
+          cache: true
+
+      - name: Download project ZIP
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+          ZIP_URL: ${{ github.event.inputs.zip_url }}
+        run: |
+          set -e
+          mkdir -p work
+          DOWNLOADED=0
+
+          # Prioritas 1: download dari GitHub Release (paling andal)
+          if [ -n "$RELEASE_TAG" ]; then
+            echo "Download dari release tag: $RELEASE_TAG"
+            # pakai gh api
+            if command -v gh >/dev/null 2>&1; then
+              gh release download "$RELEASE_TAG" --pattern "*.zip" --dir . || true
+            fi
+            # fallback curl API
+            if [ ! -f *.zip ] 2>/dev/null; then
+              ASSET_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${{ github.repository }}/releases/tags/${RELEASE_TAG}" \
+                | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['assets'][0]['url'] if d.get('assets') else '')" 2>/dev/null || true)
+              if [ -n "$ASSET_URL" ]; then
+                curl -L --fail -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" \
+                  -o project.zip "$ASSET_URL"
+                DOWNLOADED=1
+              fi
+            else
+              mv *.zip project.zip 2>/dev/null || true
+              DOWNLOADED=1
+            fi
+          fi
+
+          # Prioritas 2: zip_url langsung
+          if [ "$DOWNLOADED" != "1" ] && [ -n "$ZIP_URL" ]; then
+            echo "Download dari zip_url..."
+            curl -L --fail --retry 5 --retry-delay 3 -A "Mozilla/5.0" -o project.zip "$ZIP_URL" || {
+              echo "Gagal download zip_url"
+              exit 1
+            }
+            DOWNLOADED=1
+          fi
+
+          if [ ! -f project.zip ]; then
+            echo "ERROR: project.zip tidak ada. Kirim release_tag atau zip_url."
+            exit 1
+          fi
+
+          unzip -o project.zip -d work
+          FOUND=$(find work -name "pubspec.yaml" -type f 2>/dev/null | head -n 1)
+          if [ -z "$FOUND" ]; then
+            echo "ERROR: pubspec.yaml tidak ditemukan"
+            find work -maxdepth 4 -type f | head -40
+            exit 1
+          fi
+          PROJ_DIR=$(dirname "$FOUND")
+          echo "PROJECT_DIR=$PROJ_DIR" >> $GITHUB_ENV
+          echo "Project: $PROJ_DIR"
+
+      - name: Flutter pub get
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter clean || true
+          flutter pub get
+
+      - name: Build APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          MODE=$(echo "${{ github.event.inputs.build_mode }}" | tr '[:upper:]' '[:lower:]')
+          if [ "$MODE" = "debug" ]; then
+            flutter build apk --debug
+          else
+            flutter build apk --release
+          fi
+
+      - name: Prepare APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          APK=$(find build -name "*.apk" -type f 2>/dev/null | head -n 1)
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK tidak ditemukan"
+            find build -type f 2>/dev/null | head -30 || true
+            exit 1
+          fi
+          cp "$APK" "$GITHUB_WORKSPACE/app-release.apk"
+          ls -lh "$GITHUB_WORKSPACE/app-release.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apk
+          path: app-release.apk
+          retention-days: 2
+          if-no-files-found: error
